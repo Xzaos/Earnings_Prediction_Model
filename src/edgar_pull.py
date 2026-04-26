@@ -1,15 +1,15 @@
 """
 SEC EDGAR companyfacts puller.
 
-Fetches quarterly EPS observations for S&P 500 tickers using the EDGAR
+Fetches quarterly fundamental facts for S&P 500 tickers using the EDGAR
 companyfacts API, with caching, rate limiting, and strict point-in-time
 correctness (earliest filing per period, never amendments).
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 WARNING — FY ROWS CONTAIN CUMULATIVE ANNUAL EPS, NOT Q4-ONLY EPS
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-Rows with fp == 'FY' come from 10-K annual filings. Their `eps` value is the
-full-year cumulative diluted EPS (sum of all four quarters), NOT the Q4
+Rows with fp == 'FY' come from 10-K annual filings. Their `value` (and `eps`
+in the backward-compat view) is the full-year cumulative figure, NOT the Q4
 standalone figure. Annual filers (including Apple, Microsoft, most S&P 500
 companies) do not file a separate 10-Q for Q4; the 10-K is the only source.
 
@@ -34,10 +34,25 @@ Using an amended value (e.g. 10-Q/A filed 90 days after the original 10-Q)
 for a prediction made at time T would introduce silent look-ahead bias if the
 amendment wasn't yet filed at T. We therefore keep only the EARLIEST filing
 for each (cik, period_end) pair — i.e., the value that was first made public.
+
+Duration filter
+---------------
+EDGAR stores both standalone (~90d) and cumulative YTD (~180d for H1, ~270d
+for 9-month) income-statement facts for Q2 and Q3, all sharing the same
+period_end and fp label. Only the standalone (~90d) entry reflects the quarter
+in isolation; YTD entries would corrupt the FY-Q1-Q2-Q3 subtraction used in
+derive_quarterly_eps. We keep Q1/Q2/Q3/Q4 with duration 60–130 days and FY
+with duration 340–400 days.
+
+Balance sheet items (Assets, Liabilities, etc.) are point-in-time "instant"
+snapshots: EDGAR stores only an end date, no start date. For these facts the
+duration filter is skipped entirely (controlled by presence of the 'start'
+field in the raw fact dict).
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import time
 from pathlib import Path
@@ -65,6 +80,44 @@ _MIN_REQUEST_INTERVAL = 1.0 / 10.0  # seconds
 
 _last_request_time: float = 0.0
 
+# --------------------------------------------------------------------------- #
+# XBRL tag and unit mappings                                                  #
+# --------------------------------------------------------------------------- #
+
+# Maps a canonical fact name to an ordered list of XBRL tag candidates.
+# _extract_facts tries each tag in order and stops at the first non-empty one.
+# This handles tag renames across GAAP taxonomy versions (e.g., ASC 606 revenue).
+XBRL_TAGS: dict[str, list[str]] = {
+    "eps_diluted":             ["EarningsPerShareDiluted", "EarningsPerShareBasic"],
+    "revenue":                 ["Revenues",
+                                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                                "SalesRevenueNet"],
+    "cost_of_revenue":        ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"],
+    "gross_profit":           ["GrossProfit"],
+    "operating_income":       ["OperatingIncomeLoss"],
+    "net_income":             ["NetIncomeLoss"],
+    "total_assets":           ["Assets"],
+    "total_current_assets":   ["AssetsCurrent"],
+    "cash":                   ["CashAndCashEquivalentsAtCarryingValue", "Cash"],
+    "total_current_liabilities": ["LiabilitiesCurrent"],
+    "short_term_debt":        ["DebtCurrent", "ShortTermBorrowings"],
+    "income_taxes_payable":   ["AccruedIncomeTaxesCurrent", "TaxesPayableCurrent"],
+    "depreciation_amortization": ["DepreciationDepletionAndAmortization",
+                                  "DepreciationAndAmortization",
+                                  "Depreciation"],
+    "accounts_receivable":    ["AccountsReceivableNetCurrent", "ReceivablesNetCurrent"],
+    "inventory":              ["InventoryNet"],
+    "capex":                  ["PaymentsToAcquirePropertyPlantAndEquipment"],
+}
+
+# Maps a canonical fact name to the EDGAR unit string used to look up facts
+# within the "units" dict of a companyfacts entry.
+# Facts not listed here default to "USD" via XBRL_UNITS.get(fact_name, "USD").
+XBRL_UNITS: dict[str, str] = {
+    "eps_diluted": "USD/shares",
+    # share-count facts (e.g. shares_outstanding) would use "shares" here
+}
+
 
 # --------------------------------------------------------------------------- #
 # Network / cache helpers                                                      #
@@ -78,7 +131,6 @@ def _cache_path(cik: int) -> Path:
 def _is_cache_fresh(path: Path) -> bool:
     if not path.exists():
         return False
-    import datetime
     age = datetime.datetime.now() - datetime.datetime.fromtimestamp(path.stat().st_mtime)
     return age.days < CACHE_MAX_AGE_DAYS
 
@@ -111,7 +163,7 @@ def _fetch_companyfacts(cik: int, force_refresh: bool = False) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# EPS extraction                                                               #
+# Fact extraction                                                              #
 # --------------------------------------------------------------------------- #
 
 # Quarterly period codes. "FY" annual filings are kept because they represent
@@ -124,26 +176,33 @@ _QUARTERLY_FP = {"Q1", "Q2", "Q3", "Q4", "FY"}
 _ACCEPTED_FORMS = {"10-Q", "10-K", "10-K/A", "10-Q/A", "20-F", "20-F/A"}
 
 
-def _extract_eps_facts(data: dict, cik: int, ticker: str) -> pd.DataFrame:
-    """Parse companyfacts JSON into a tidy EPS DataFrame.
+def _extract_facts(
+    data: dict,
+    tag_candidates: list[str],
+    ticker: str,
+    cik: int,
+    value_unit: str,
+) -> pd.DataFrame:
+    """Extract one fact from a companyfacts JSON blob.
 
-    Tries us-gaap.EarningsPerShareDiluted first; falls back to
-    us-gaap.EarningsPerShareBasic if absent or empty.
+    Tries each tag in tag_candidates in order; stops at the first non-empty
+    one. Applies the duration filter for income-statement facts (those with a
+    'start' field) and skips it for balance-sheet instant facts (no 'start').
+    Deduplicates by (cik, period_end), keeping the earliest-filed value.
 
-    Returns an empty DataFrame (with the correct columns) when neither field
-    exists.
+    Returns a DataFrame with columns:
+        ticker, cik, period_end, value, filed, form, fp, accn
+    Returns an empty DataFrame (correct columns) when no data is found.
     """
-    _COLS = ["ticker", "cik", "period_end", "eps", "filed", "form", "fp", "accn"]
+    _COLS = ["ticker", "cik", "period_end", "value", "filed", "form", "fp", "accn"]
 
     us_gaap = data.get("facts", {}).get("us-gaap", {})
 
-    raw_facts: Optional[list] = None
-    for field in ("EarningsPerShareDiluted", "EarningsPerShareBasic"):
-        entry = us_gaap.get(field, {})
-        # Facts live under units, keyed by unit label. For EPS the unit is
-        # "USD/shares"; fall back to the first available unit if needed.
+    raw_facts: list | None = None
+    for tag in tag_candidates:
+        entry = us_gaap.get(tag, {})
         units = entry.get("units", {})
-        facts = units.get("USD/shares") or (next(iter(units.values()), None) if units else None)
+        facts = units.get(value_unit) or (next(iter(units.values()), None) if units else None)
         if facts:
             raw_facts = facts
             break
@@ -154,37 +213,32 @@ def _extract_eps_facts(data: dict, cik: int, ticker: str) -> pd.DataFrame:
     rows = []
     for fact in raw_facts:
         fp = fact.get("fp", "")
-        form = fact.get("form", "")
         if fp not in _QUARTERLY_FP:
             continue
 
-        # Duration filter: EDGAR companyfacts stores BOTH standalone (~90d)
-        # AND cumulative YTD (~180d for H1, ~270d for 9-month) EPS entries for
-        # Q2 and Q3, all sharing the same period_end and fp label. Only the
-        # standalone (~90d) entry reflects the quarter in isolation; the YTD
-        # entries would corrupt the FY-Q1-Q2-Q3 subtraction in derive_quarterly_eps.
-        # We keep:  Q1/Q2/Q3/Q4 where duration ≈ 60–130 days (one quarter)
-        #           FY where duration ≈ 340–400 days (one year)
-        # When start is absent (e.g. synthetic test data) the filter is skipped.
-        start_str = fact.get("start")
-        end_str = fact.get("end", "")
-        if start_str and end_str:
-            import datetime as _dt
-            dur = (_dt.date.fromisoformat(end_str) - _dt.date.fromisoformat(start_str)).days
+        # XBRL distinguishes durations (income statement, cash flow — has both 'start' and 'end')
+        # from instants (balance sheet — has only 'end'). The presence/absence of 'start' is the
+        # structural signal. We only filter by duration when start is genuinely present.
+        if "start" in fact:
+            start_str = fact["start"]
+            end_str = fact.get("end", "")
+            if not start_str or not end_str:
+                # Malformed fact — start key present but empty/null. Skip rather than guess.
+                continue
+            dur = (datetime.date.fromisoformat(end_str) - datetime.date.fromisoformat(start_str)).days
             if fp == "FY" and not (340 <= dur <= 400):
                 continue
             if fp in {"Q1", "Q2", "Q3", "Q4"} and not (60 <= dur <= 130):
                 continue
+        # else: instant fact, no duration filter applies
 
-        # We still ingest amendments here; the point-in-time deduplication
-        # below discards them in favour of the earliest filing.
         rows.append({
             "ticker": ticker,
             "cik": cik,
             "period_end": pd.to_datetime(fact["end"]),
-            "eps": float(fact["val"]),
+            "value": float(fact["val"]),
             "filed": pd.to_datetime(fact["filed"]),
-            "form": form,
+            "form": fact.get("form", ""),
             "fp": fp,
             "accn": fact.get("accn", ""),
         })
@@ -207,37 +261,61 @@ def _extract_eps_facts(data: dict, cik: int, ticker: str) -> pd.DataFrame:
     return df
 
 
+def _extract_eps_facts(data: dict, cik: int, ticker: str) -> pd.DataFrame:
+    """Backward-compatible wrapper around _extract_facts for EPS.
+
+    Returns the same schema as before the refactor:
+        ticker, cik, period_end, eps, filed, form, fp, accn
+    """
+    _EPS_COLS = ["ticker", "cik", "period_end", "eps", "filed", "form", "fp", "accn"]
+    df = _extract_facts(
+        data,
+        tag_candidates=XBRL_TAGS["eps_diluted"],
+        ticker=ticker,
+        cik=cik,
+        value_unit=XBRL_UNITS.get("eps_diluted", "USD"),
+    )
+    if df.empty:
+        return pd.DataFrame(columns=_EPS_COLS)
+    return df.rename(columns={"value": "eps"})
+
+
 # --------------------------------------------------------------------------- #
 # Public API                                                                   #
 # --------------------------------------------------------------------------- #
 
 
-def pull_eps_for_tickers(
+def pull_facts_for_tickers(
     tickers: list[str],
     cik_lookup: dict[str, str],
+    fact_names: list[str],
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Pull quarterly EPS for every ticker, return a combined panel.
+    """Download one or more fundamental facts for every ticker.
 
     Parameters
     ----------
     tickers : list[str]
-        Ticker symbols to pull. Must all have entries in `cik_lookup`.
+        Ticker symbols to fetch. Must all have entries in `cik_lookup`.
     cik_lookup : dict[str, str]
         Mapping from ticker to CIK string (zero-padded or plain integer string).
+    fact_names : list[str]
+        Canonical fact names to extract. Each must be a key in XBRL_TAGS.
+        Example: ["eps_diluted", "revenue", "total_assets"]
     force_refresh : bool
         Re-fetch from EDGAR even if the per-ticker cache is fresh.
 
     Returns
     -------
     pd.DataFrame
-        Columns: ticker, cik, period_end, eps, filed, form, fp, accn.
-        One row per (ticker, period_end) after point-in-time deduplication.
-
-        WARNING: rows where fp == 'FY' carry cumulative annual EPS, not Q4-only.
-        Pass this DataFrame through derive_quarterly_eps() before any modelling
-        or feature-engineering step that expects standalone quarterly figures.
+        Long-format panel. Columns:
+            ticker, cik, period_end, fact_name, value, filed, form, fp, accn
+        One row per (ticker, period_end, fact_name) after point-in-time
+        deduplication. FY rows carry cumulative annual values (not Q4-only);
+        pass through derive_quarterly_eps() for EPS before modelling.
     """
+    _COLS = ["ticker", "cik", "period_end", "fact_name", "value", "filed", "form", "fp", "accn"]
+
     frames: list[pd.DataFrame] = []
     missing_cik: list[str] = []
 
@@ -260,21 +338,46 @@ def pull_eps_for_tickers(
             print(f"  WARNING: Failed to fetch {ticker}: {exc}")
             continue
 
-        df = _extract_eps_facts(data, cik=cik, ticker=ticker)
-        if not df.empty:
-            frames.append(df)
+        for fact_name in fact_names:
+            tag_candidates = XBRL_TAGS.get(fact_name, [fact_name])
+            value_unit = XBRL_UNITS.get(fact_name, "USD")
+            df = _extract_facts(data, tag_candidates, ticker=ticker, cik=cik, value_unit=value_unit)
+            if not df.empty:
+                df.insert(df.columns.get_loc("value"), "fact_name", fact_name)
+                frames.append(df)
 
     if missing_cik:
         print(f"  WARNING: No CIK found for {len(missing_cik)} tickers: {missing_cik[:10]}...")
 
     if not frames:
-        _COLS = ["ticker", "cik", "period_end", "eps", "filed", "form", "fp", "accn"]
         return pd.DataFrame(columns=_COLS)
 
     out = pd.concat(frames, ignore_index=True)
     out["period_end"] = pd.to_datetime(out["period_end"])
     out["filed"] = pd.to_datetime(out["filed"])
     return out
+
+
+def pull_eps_for_tickers(
+    tickers: list[str],
+    cik_lookup: dict[str, str],
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """Pull quarterly EPS for every ticker, return a combined panel.
+
+    Thin wrapper around pull_facts_for_tickers that reshapes the output to
+    the original contract: columns ticker, cik, period_end, eps, filed, form,
+    fp, accn (one row per (ticker, period_end) after point-in-time dedup).
+
+    WARNING: rows where fp == 'FY' carry cumulative annual EPS, not Q4-only.
+    Pass this DataFrame through derive_quarterly_eps() before any modelling
+    or feature-engineering step that expects standalone quarterly figures.
+    """
+    _EPS_COLS = ["ticker", "cik", "period_end", "eps", "filed", "form", "fp", "accn"]
+    df = pull_facts_for_tickers(tickers, cik_lookup, ["eps_diluted"], force_refresh=force_refresh)
+    if df.empty:
+        return pd.DataFrame(columns=_EPS_COLS)
+    return df.rename(columns={"value": "eps"}).drop(columns=["fact_name"])
 
 
 def derive_quarterly_eps(df: pd.DataFrame) -> pd.DataFrame:

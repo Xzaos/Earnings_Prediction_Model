@@ -21,7 +21,13 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from src.edgar_pull import _extract_eps_facts, derive_quarterly_eps
+from src.edgar_pull import (
+    _extract_eps_facts,
+    _extract_facts,
+    derive_quarterly_eps,
+    XBRL_TAGS,
+    XBRL_UNITS,
+)
 
 _COLS = ["ticker", "cik", "period_end", "eps", "filed", "form", "fp", "accn"]
 
@@ -382,3 +388,212 @@ class TestDeriveQuarterlyEps:
         assert 1.45 <= q4_eps <= 1.50, (
             f"AAPL FY2023 derived Q4 EPS expected in [1.45, 1.50], got {q4_eps:.4f}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# _extract_facts: generalized multi-fact extraction                           #
+# --------------------------------------------------------------------------- #
+
+
+class TestExtractFacts:
+    """Tests for the generalized _extract_facts function."""
+
+    # --- helpers ---
+
+    def _make_revenue_json(self, facts: list[dict]) -> dict:
+        """Wrap facts in the EDGAR companyfacts schema under the revenue tag."""
+        return {
+            "facts": {
+                "us-gaap": {
+                    "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                        "units": {"USD": facts}
+                    }
+                }
+            }
+        }
+
+    def _make_assets_json(self, facts: list[dict]) -> dict:
+        """Wrap facts under the Assets tag (instant — no 'start' field)."""
+        return {
+            "facts": {
+                "us-gaap": {
+                    "Assets": {
+                        "units": {"USD": facts}
+                    }
+                }
+            }
+        }
+
+    # --- revenue (income-statement, has 'start') ---
+
+    def test_revenue_standalone_quarter_extracted(self):
+        """A standalone Q2 fact (~90d) should pass the duration filter."""
+        data = self._make_revenue_json([
+            {
+                "start": "2022-04-01", "end": "2022-06-30",
+                "val": 1_100_000, "filed": "2022-08-01",
+                "form": "10-Q", "fp": "Q2", "accn": "001",
+            }
+        ])
+        df = _extract_facts(data, XBRL_TAGS["revenue"], "TEST", 999, "USD")
+        assert len(df) == 1
+        assert df.iloc[0]["value"] == pytest.approx(1_100_000)
+        assert df.iloc[0]["fp"] == "Q2"
+
+    def test_revenue_ytd_cumulative_filtered_out(self):
+        """A cumulative H1 fact (~180d) under fp=Q2 must be discarded."""
+        data = self._make_revenue_json([
+            {
+                # Standalone Q2: ~91d — should pass
+                "start": "2022-04-01", "end": "2022-06-30",
+                "val": 1_100_000, "filed": "2022-08-01",
+                "form": "10-Q", "fp": "Q2", "accn": "001",
+            },
+            {
+                # Cumulative H1: ~181d — must be filtered
+                "start": "2022-01-01", "end": "2022-06-30",
+                "val": 2_200_000, "filed": "2022-08-01",
+                "form": "10-Q", "fp": "Q2", "accn": "002",
+            },
+        ])
+        df = _extract_facts(data, XBRL_TAGS["revenue"], "TEST", 999, "USD")
+        assert len(df) == 1, f"Expected 1 row (H1 cumulative filtered), got {len(df)}"
+        assert df.iloc[0]["value"] == pytest.approx(1_100_000)
+
+    def test_revenue_output_columns(self):
+        """_extract_facts must return exactly the expected column set."""
+        data = self._make_revenue_json([
+            {
+                "start": "2022-01-01", "end": "2022-03-31",
+                "val": 500_000, "filed": "2022-05-01",
+                "form": "10-Q", "fp": "Q1", "accn": "001",
+            }
+        ])
+        df = _extract_facts(data, XBRL_TAGS["revenue"], "TEST", 999, "USD")
+        expected_cols = {"ticker", "cik", "period_end", "value", "filed", "form", "fp", "accn"}
+        assert expected_cols.issubset(set(df.columns))
+        assert "fact_name" not in df.columns  # fact_name is added by pull_facts_for_tickers
+
+    # --- total_assets (balance-sheet instant: no 'start') ---
+
+    def test_balance_sheet_instant_fact_extracted_without_start(self):
+        """Assets facts have no 'start' key. Duration filter must be skipped;
+        all quarterly fp values should be retained."""
+        data = self._make_assets_json([
+            {
+                # No 'start' key — instant balance-sheet snapshot
+                "end": "2022-03-31", "val": 500_000_000,
+                "filed": "2022-05-01", "form": "10-Q", "fp": "Q1", "accn": "001",
+            },
+            {
+                "end": "2022-06-30", "val": 510_000_000,
+                "filed": "2022-08-01", "form": "10-Q", "fp": "Q2", "accn": "002",
+            },
+        ])
+        df = _extract_facts(data, XBRL_TAGS["total_assets"], "TEST", 999, "USD")
+        assert len(df) == 2, (
+            f"Expected 2 rows for instant balance-sheet facts, got {len(df)}. "
+            "Duration filter must be skipped when 'start' is absent."
+        )
+        assert set(df["fp"]) == {"Q1", "Q2"}
+
+    def test_balance_sheet_dedup_keeps_earliest_filed(self):
+        """Two Assets filings for the same period_end: keep earliest."""
+        data = self._make_assets_json([
+            {
+                "end": "2022-03-31", "val": 500_000_000,
+                "filed": "2022-05-01", "form": "10-Q", "fp": "Q1", "accn": "orig",
+            },
+            {
+                "end": "2022-03-31", "val": 520_000_000,
+                "filed": "2022-08-01", "form": "10-Q/A", "fp": "Q1", "accn": "amend",
+            },
+        ])
+        df = _extract_facts(data, XBRL_TAGS["total_assets"], "TEST", 999, "USD")
+        assert len(df) == 1
+        assert df.iloc[0]["value"] == pytest.approx(500_000_000)
+        assert df.iloc[0]["accn"] == "orig"
+
+    # --- tag fallback ---
+
+    def test_falls_back_to_second_tag_when_first_absent(self):
+        """revenue: first candidate 'Revenues' absent, second candidate present."""
+        data = {
+            "facts": {
+                "us-gaap": {
+                    # 'Revenues' tag is absent; second candidate present
+                    "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "start": "2022-01-01", "end": "2022-03-31",
+                                    "val": 900_000, "filed": "2022-05-01",
+                                    "form": "10-Q", "fp": "Q1", "accn": "001",
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        df = _extract_facts(data, XBRL_TAGS["revenue"], "TEST", 999, "USD")
+        assert len(df) == 1
+        assert df.iloc[0]["value"] == pytest.approx(900_000)
+
+    def test_all_tags_absent_returns_empty_dataframe(self):
+        """When none of the tag candidates exist, return empty DataFrame with
+        correct columns."""
+        data = {"facts": {"us-gaap": {"SomeUnrelatedTag": {}}}}
+        df = _extract_facts(data, XBRL_TAGS["inventory"], "TEST", 999, "USD")
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) == 0
+        for col in ("ticker", "cik", "period_end", "value", "filed", "form", "fp", "accn"):
+            assert col in df.columns
+
+    # --- _extract_eps_facts backward-compat wrapper ---
+
+    def test_eps_wrapper_returns_eps_column_not_value(self):
+        """_extract_eps_facts must rename 'value' → 'eps' for backward compat."""
+        data = {
+            "facts": {
+                "us-gaap": {
+                    "EarningsPerShareDiluted": {
+                        "units": {
+                            "USD/shares": [
+                                {
+                                    "end": "2022-03-31", "val": 1.50,
+                                    "filed": "2022-05-01",
+                                    "form": "10-Q", "fp": "Q1", "accn": "001",
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        df = _extract_eps_facts(data, cik=999, ticker="TEST")
+        assert "eps" in df.columns
+        assert "value" not in df.columns
+        assert df.iloc[0]["eps"] == pytest.approx(1.50)
+
+    # --- AAPL fixture smoke test ---
+
+    def test_aapl_revenue_returns_data_and_no_ytd_rows(self, aapl_data):
+        """AAPL revenue: at least one observation returned, and no YTD-cumulative
+        rows (duration filter correctly applied to whichever tag matched).
+        Note: AAPL revenue spans multiple taxonomy tags across years; the exact
+        count depends on which tag is first non-empty in XBRL_TAGS["revenue"]."""
+        df = _extract_facts(
+            aapl_data, XBRL_TAGS["revenue"], "AAPL", AAPL_CIK, "USD"
+        )
+        assert len(df) >= 1, "Expected at least one revenue observation for AAPL"
+        # All rows must be deduplicated (one per period_end)
+        assert df["period_end"].nunique() == len(df), "Duplicate period_end after dedup"
+
+    def test_aapl_total_assets_at_least_40_observations(self, aapl_data):
+        """AAPL Assets (instant fact) should have ≥40 quarterly observations."""
+        df = _extract_facts(
+            aapl_data, XBRL_TAGS["total_assets"], "AAPL", AAPL_CIK, "USD"
+        )
+        assert len(df) >= 40, f"Expected ≥40 total_assets observations for AAPL, got {len(df)}"
+        assert df["period_end"].nunique() == len(df), "Duplicate period_end after dedup"

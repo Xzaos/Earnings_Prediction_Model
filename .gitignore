@@ -1,0 +1,26 @@
+# Data — never commit
+data/raw/*
+data/interim/*
+data/processed/*
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environment
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -1,0 +1,21 @@
+# Core
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+
+# Data pulling
+yfinance>=0.2.40
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+
+# Modeling (used by later notebooks)
+scikit-learn>=1.4
+lightgbm>=4.3
+
+# Notebooks
+jupyter>=1.0
+matplotlib>=3.8
+
+# Testing
+pytest>=8.0

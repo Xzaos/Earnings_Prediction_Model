@@ -89,9 +89,9 @@ _last_request_time: float = 0.0
 # This handles tag renames across GAAP taxonomy versions (e.g., ASC 606 revenue).
 XBRL_TAGS: dict[str, list[str]] = {
     "eps_diluted":             ["EarningsPerShareDiluted", "EarningsPerShareBasic"],
-    "revenue":                 ["Revenues",
+    "revenue":                 ["SalesRevenueNet",
                                 "RevenueFromContractWithCustomerExcludingAssessedTax",
-                                "SalesRevenueNet"],
+                                "Revenues"],
     "cost_of_revenue":        ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"],
     "gross_profit":           ["GrossProfit"],
     "operating_income":       ["OperatingIncomeLoss"],
